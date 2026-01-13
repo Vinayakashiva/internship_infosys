@@ -14,7 +14,7 @@ from PIL import Image
 st.set_page_config(page_title="Batch PCB Diagnostic System", layout="wide")
 
 # Path to your local template folder
-TEMPLATE_DIR = "D:\PCB_DATASET\PCB_USED"
+TEMPLATE_DIR = "PCB_USED"
 
 if not os.path.exists(TEMPLATE_DIR):
     os.makedirs(TEMPLATE_DIR)
@@ -119,7 +119,7 @@ if not template_files:
 else:
     selected_template = st.sidebar.selectbox("Active Reference Template", template_files)
 
-model_path = st.sidebar.text_input("Model Path", r"C:\Users\vinay\PycharmProjects\internship_infosys\pcb_yolo_results\run_high_acc\weights\best.pt")
+model_path = st.sidebar.text_input("Model Path", "best.pt")
 model = load_yolo_model(model_path)
 conf_threshold = st.sidebar.slider("Confidence", 0.0, 1.0, 0.5)
 
@@ -188,4 +188,5 @@ if selected_template:
             st.download_button("📥 Download Master CSV Report", csv, "pcb_batch_report.csv", "text/csv")
 else:
     st.warning("No template selected. Check your 'pcb_templates' folder.")
+
 
