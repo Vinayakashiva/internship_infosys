@@ -4,24 +4,27 @@ import numpy as np
 import pandas as pd
 import os
 import time
-import io
 from ultralytics import YOLO
-from PIL import Image
+import tkinter as tk
+from tkinter import filedialog
+import plotly.express as px
 
 # ==========================================
 # 1. CONFIGURATION & PATHS
 # ==========================================
 st.set_page_config(page_title="Batch PCB Diagnostic System", layout="wide")
 
-# Path to your local template folder
-TEMPLATE_DIR = "PCB_USED"
+TEMPLATE_DIR = r"D:\PCB_DATASET\PCB_USED"
 
 if not os.path.exists(TEMPLATE_DIR):
-    os.makedirs(TEMPLATE_DIR)
+    try:
+        os.makedirs(TEMPLATE_DIR)
+    except:
+        pass
 
 
 # ==========================================
-# 2. HELPER FUNCTIONS (Your Original Logic)
+# 2. HELPER FUNCTIONS
 # ==========================================
 
 @st.cache_resource
@@ -32,26 +35,91 @@ def load_yolo_model(path):
         return None
 
 
-def analyze_pcb(template_img, test_img, model, conf_threshold=0.5):
+@st.cache_resource
+def load_all_templates(template_dir):
+    """Loads all valid template images into a dictionary {filename: image_data}"""
+    templates = {}
+    if not os.path.exists(template_dir):
+        return templates
+
+    valid_exts = ('.png', '.jpg', '.jpeg')
+    for f in os.listdir(template_dir):
+        if f.lower().endswith(valid_exts):
+            path = os.path.join(template_dir, f)
+            img = cv2.imread(path)
+            if img is not None:
+                templates[f] = img
+    return templates
+
+
+def find_best_matching_template(test_img, template_dict):
     """
-    STRICT PRESERVATION OF YOUR LOGIC:
-    Module 1: CV Subtraction (Localizes differences)
-    Module 2: YOLO Classification (Identifies defect types)
+    Compares the test image against ALL templates to find the correct reference.
+    Returns: (best_template_name, best_template_image, match_score)
     """
+    best_score = -1
+    best_name = None
+    best_img = None
+
+    # Resize for speed optimization during matching
+    test_thumb = cv2.resize(test_img, (200, 200))
+    test_gray = cv2.cvtColor(test_thumb, cv2.COLOR_BGR2GRAY)
+
+    for name, tmpl_img in template_dict.items():
+        tmpl_thumb = cv2.resize(tmpl_img, (200, 200))
+        tmpl_gray = cv2.cvtColor(tmpl_thumb, cv2.COLOR_BGR2GRAY)
+
+        score = cv2.matchTemplate(test_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)[0][0]
+
+        if score > best_score:
+            best_score = score
+            best_name = name
+            best_img = tmpl_img
+
+    return best_name, best_img, best_score
+
+
+def determine_qc_status(detections):
+    if not detections: return "PASS", "✅", "#28a745"
+    CRITICAL = ["open_circuit", "short", "missing_hole"]
+    if any(d['Type'] in CRITICAL for d in detections):
+        return "SCRAP", "❌", "#dc3545"
+    return "REWORK", "⚠️", "#ffc107"
+
+
+def generate_heatmap(template_shape, detections_subset):
+    """Generates a density heatmap for a specific subset of detections"""
+    heatmap_mask = np.zeros((template_shape[0], template_shape[1]), dtype=np.uint8)
+
+    for det in detections_subset:
+        try:
+            loc = det['Location'].replace('(', '').replace(')', '').split(',')
+            x, y = int(loc[0]), int(loc[1])
+
+            # Draw gradient circle
+            cv2.circle(heatmap_mask, (x, y), 40, (50), -1)
+            cv2.circle(heatmap_mask, (x, y), 20, (100), -1)
+            cv2.circle(heatmap_mask, (x, y), 5, (255), -1)
+        except:
+            continue
+
+    heatmap_color = cv2.applyColorMap(heatmap_mask, cv2.COLORMAP_JET)
+    return heatmap_color
+
+
+def analyze_pcb(template_img, test_img, model):
     # --- Module 1: Localization ---
     gray_template = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
     gray_test = cv2.cvtColor(test_img, cv2.COLOR_BGR2GRAY)
 
-    # Dimensional Alignment
+    # Force Resize Test Image to Match Template Exactly
     if gray_template.shape != gray_test.shape:
-        gray_test = cv2.resize(gray_test, (gray_template.shape[1], gray_template.shape[0]))
         test_img = cv2.resize(test_img, (template_img.shape[1], template_img.shape[0]))
+        gray_test = cv2.resize(gray_test, (template_img.shape[1], template_img.shape[0]))
 
-    # Compute Difference & Threshold
     diff = cv2.absdiff(gray_template, gray_test)
     _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Morphological Noise Removal
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -84,7 +152,7 @@ def analyze_pcb(template_img, test_img, model, conf_threshold=0.5):
                 confidence = results[0].probs.top1conf.item()
                 label = results[0].names[top1]
 
-                # Color coding based on your logic
+                # Color logic
                 if label == "mouse_bite":
                     color = (255, 0, 0)
                 elif label == "missing_hole":
@@ -104,89 +172,179 @@ def analyze_pcb(template_img, test_img, model, conf_threshold=0.5):
             "Location": f"({x}, {y})"
         })
 
-    return final_output, diff, mask, detections
+    return final_output, detections
+
+
+def select_folder():
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes('-topmost', 1)
+    path = filedialog.askdirectory(master=root)
+    root.destroy()
+    return path
 
 
 # ==========================================
-# 3. UI: SIDEBAR
+# 3. UI & INITIALIZATION
 # ==========================================
-st.sidebar.title("⚙️ System Controls")
-template_files = [f for f in os.listdir(TEMPLATE_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-
-if not template_files:
-    st.sidebar.error(f"Please add a template image to: /{TEMPLATE_DIR}")
-    selected_template = None
-else:
-    selected_template = st.sidebar.selectbox("Active Reference Template", template_files)
-
-model_path = st.sidebar.text_input("Model Path", "best.pt")
+st.sidebar.title("⚙️ Configuration")
+model_path = st.sidebar.text_input("Model Path",
+                                   r"C:\Users\vinay\PycharmProjects\internship_infosys\pcb_yolo_results\run_high_acc\weights\best.pt")
 model = load_yolo_model(model_path)
-conf_threshold = st.sidebar.slider("Confidence", 0.0, 1.0, 0.5)
+
+# Load ALL templates
+template_library = load_all_templates(TEMPLATE_DIR)
+st.sidebar.success(f"Loaded {len(template_library)} reference templates from database.")
 
 # ==========================================
 # 4. MAIN INTERFACE
 # ==========================================
-st.title("🔍 Automated PCB Diagnostic Hub")
+st.title("🔍 Universal PCB Diagnostic Hub")
+st.markdown("### Auto-Matching Mode Enabled")
+st.caption("Upload mixed batches. The system will automatically find the correct reference template for each board.")
 
-if selected_template:
-    t_path = os.path.join(TEMPLATE_DIR, selected_template)
-    template_img = cv2.imread(t_path)
+if 'selected_folder_path' not in st.session_state:
+    st.session_state['selected_folder_path'] = ''
 
-    col_ref, col_up = st.columns([1, 2])
-    with col_ref:
-        st.subheader("Reference Board")
-        st.image(template_img, channels="BGR", use_container_width=True, caption=selected_template)
+col_input, col_status = st.columns([2, 1])
 
-    with col_up:
-        st.subheader("Batch Test Upload")
-        uploaded_files = st.file_uploader("Upload Defective Boards", type=['png', 'jpg', 'jpeg'],
+with col_input:
+    input_method = st.radio("Select Input:", ["File Upload", "Local Folder"], horizontal=True)
+    files_to_process = []
+
+    if input_method == "File Upload":
+        uploaded_files = st.file_uploader("Upload Mixed PCB Batch", type=['png', 'jpg', 'jpeg'],
                                           accept_multiple_files=True)
+        if uploaded_files:
+            files_to_process = [(f.name, f, 'streamlit_upload') for f in uploaded_files]
+    else:
+        if st.button("📂 Browse Folder"):
+            p = select_folder()
+            if p: st.session_state['selected_folder_path'] = p
+        st.text_input("Folder:", st.session_state['selected_folder_path'], disabled=True)
+        if st.session_state['selected_folder_path']:
+            local_files = [f for f in os.listdir(st.session_state['selected_folder_path']) if
+                           f.lower().endswith(('png', 'jpg', 'jpeg'))]
+            files_to_process = [(f, os.path.join(st.session_state['selected_folder_path'], f), 'local_path') for f in
+                                local_files]
 
-    if uploaded_files and st.button("🚀 Start Batch Analysis"):
-        master_log = []
-        start_time = time.perf_counter()
+# --- BATCH PROCESSING ---
+if files_to_process and st.button("🚀 Start Universal Scan"):
 
-        for uploaded_file in uploaded_files:
-            # Convert upload to OpenCV
-            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    if not template_library:
+        st.error(f"No templates found in {TEMPLATE_DIR}. Please add reference images.")
+        st.stop()
+
+    master_log = []
+    all_global_detections = []
+
+    start_time = time.perf_counter()
+    progress_bar = st.progress(0)
+
+    results_container = st.container()
+
+    for i, (fname, f_source, f_type) in enumerate(files_to_process):
+        if f_type == 'streamlit_upload':
+            file_bytes = np.asarray(bytearray(f_source.read()), dtype=np.uint8)
             test_img = cv2.imdecode(file_bytes, 1)
+            f_source.seek(0)
+        else:
+            test_img = cv2.imread(f_source)
 
-            # PROCESS (Binary Mask and Diff Map are returned here)
-            res_img, diff_map, binary_mask, detections = analyze_pcb(template_img, test_img, model, conf_threshold)
+        if test_img is not None:
+            # AUTO-MATCH TEMPLATE
+            matched_name, matched_tmpl, score = find_best_matching_template(test_img, template_library)
 
-            # Save to log
+            if score < 0.5:
+                st.warning(f"Could not find a good reference for {fname}. Skipping.")
+                continue
+
+            # Analyze
+            res_img, detections = analyze_pcb(matched_tmpl, test_img, model)
+
+            # QC Decision
+            qc_status, qc_icon, qc_color = determine_qc_status(detections)
+
+            # Logging
             df_curr = pd.DataFrame(detections)
-            df_curr['Filename'] = uploaded_file.name
+            df_curr['Filename'] = fname
+            df_curr['Matched_Template'] = matched_name
+            df_curr['QC_Decision'] = qc_status
             master_log.append(df_curr)
 
-            # --- DISPLAY RESULTS IN TABS ---
-            with st.expander(f"📋 Results for: {uploaded_file.name}", expanded=True):
-                tab1, tab2, tab3 = st.tabs(["🖼️ Final Annotation", "⚫ Binary Mask", "📉 Difference Map"])
+            for d in detections:
+                d['Matched_Template'] = matched_name
+                all_global_detections.append(d)
 
-                with tab1:
-                    st.image(res_img, channels="BGR", use_container_width=True)
-                    if detections:
-                        st.dataframe(df_curr.drop(columns=['Filename']))
-                    else:
-                        st.success("No defects found in this board.")
+            # Display Results (Hidden Matched Name in UI)
+            with results_container:
+                st.markdown(f"""
+                <div style="border: 1px solid #444; padding: 10px; border-radius: 5px; margin-bottom: 5px; background-color: #262730;">
+                    <b>{fname}</b>
+                    <span style="float:right; background-color:{qc_color}; padding: 2px 8px; border-radius: 4px; color:white;">
+                        {qc_icon} {qc_status}
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
 
-                with tab2:
-                    st.image(binary_mask, caption="Module 1: Identified ROI Regions", use_container_width=True)
+                with st.expander(f"Show Analysis"):
+                    c1, c2 = st.columns(2)
+                    c1.image(res_img, channels="BGR", caption="Defect Map")
+                    c2.dataframe(df_curr)
 
-                with tab3:
-                    st.image(diff_map, caption="Pixel Difference Intensity", use_container_width=True)
+        progress_bar.progress((i + 1) / len(files_to_process))
 
-        # Performance Summary
-        duration = time.perf_counter() - start_time
+    # ==========================================
+    # 5. MANUFACTURING INSIGHTS DASHBOARD
+    # ==========================================
+    if master_log:
         st.divider()
-        st.info(f"Batch completed: {len(uploaded_files)} images in {duration:.2f} seconds.")
+        final_report = pd.concat(master_log)
 
-        # Final Export
-        if master_log:
-            final_report = pd.concat(master_log)
-            csv = final_report.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Master CSV Report", csv, "pcb_batch_report.csv", "text/csv")
-else:
-    st.warning("No template selected. Check your 'pcb_templates' folder.")
+        st.markdown("## 📊 Manufacturing Insights Dashboard")
 
+        col_metrics1, col_metrics2 = st.columns(2)
 
+        # Metric 1: Yield Rates
+        with col_metrics1:
+            st.subheader("Production Yield")
+            unique_boards = final_report[['Filename', 'QC_Decision']].drop_duplicates()
+            status_counts = unique_boards['QC_Decision'].value_counts().reset_index()
+            status_counts.columns = ['Status', 'Count']
+
+            fig_status = px.bar(status_counts, x='Status', y='Count', color='Status',
+                                color_discrete_map={"PASS": "#28a745", "REWORK": "#ffc107", "SCRAP": "#dc3545"},
+                                title="Batch Yield Overview")
+            st.plotly_chart(fig_status, use_container_width=True)
+
+        # Metric 2: Defect Types
+        with col_metrics2:
+            st.subheader("Defect Pareto Chart")
+            defect_counts = final_report['Type'].value_counts().reset_index()
+            defect_counts.columns = ['Defect Type', 'Count']
+
+            fig_pie = px.pie(defect_counts, values='Count', names='Defect Type',
+                             title='Defect Distribution', hole=0.4)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        # --- HEATMAPS (DYNAMIC PER BOARD TYPE) ---
+        st.subheader("🔥 Root Cause Maps (Per Board Type)")
+
+        unique_templates = final_report['Matched_Template'].unique()
+
+        for template_name in unique_templates:
+            subset_detections = [d for d in all_global_detections if d.get('Matched_Template') == template_name]
+
+            if subset_detections and template_name in template_library:
+                ref_img = template_library[template_name]
+
+                heatmap_color = generate_heatmap(ref_img.shape, subset_detections)
+                overlay = cv2.addWeighted(ref_img, 0.7, heatmap_color, 0.6, 0)
+
+                with st.expander(f"Heatmap for: {template_name}", expanded=True):
+                    st.image(overlay, channels="BGR", use_container_width=True,
+                             caption=f"Defect Concentrations on {template_name}")
+
+        # Download Report
+        csv = final_report.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Analytical Report (CSV)", csv, "universal_batch_analytics.csv", "text/csv")
