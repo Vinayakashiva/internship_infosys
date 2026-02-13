@@ -1,6 +1,7 @@
 streamlit
 opencv-python-headless
-ultralytics
-pandas
 numpy
+pandas
+ultralytics
 plotly
+
