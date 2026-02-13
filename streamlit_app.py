@@ -1,116 +1,92 @@
 import streamlit as st
-import cv2
 import numpy as np
 import pandas as pd
 import os
-import time
+from PIL import Image
 from ultralytics import YOLO
 import plotly.express as px
 
-# ==========================================
-# 1. CONFIGURATION & PATHS
-# ==========================================
-st.set_page_config(page_title="Batch PCB Diagnostic System", layout="wide")
+st.set_page_config(page_title="PCB Diagnostic System", layout="wide")
 
-# HIGHLIGHTED TEMPLATE PATH
-# Note: On Streamlit Cloud, change this to a relative path like "PCB_USED" 
-# and upload the folder to your GitHub repo.
-TEMPLATE_DIR = r"PCB_USED"
-
-if not os.path.exists(TEMPLATE_DIR):
-    try:
-        os.makedirs(TEMPLATE_DIR)
-    except:
-        pass
-
-
-# ==========================================
-# 2. HELPER FUNCTIONS (Logic Unchanged)
-# ==========================================
+TEMPLATE_DIR = "PCB_USED"
 
 @st.cache_resource
-def load_yolo_model(path):
-    try:
+def load_model(path):
+    if os.path.exists(path):
         return YOLO(path)
-    except:
-        return None
-
+    return None
 
 @st.cache_resource
-def load_all_templates(template_dir):
-    """Loads all valid template images into a dictionary {filename: image_data}"""
+def load_templates(folder):
     templates = {}
-    if not os.path.exists(template_dir):
+    if not os.path.exists(folder):
         return templates
 
-    valid_exts = ('.png', '.jpg', '.jpeg')
-    for f in os.listdir(template_dir):
-        if f.lower().endswith(valid_exts):
-            path = os.path.join(template_dir, f)
-            img = cv2.imread(path)
-            if img is not None:
-                templates[f] = img
+    for f in os.listdir(folder):
+        if f.lower().endswith(("png", "jpg", "jpeg")):
+            img = Image.open(os.path.join(folder, f)).convert("RGB")
+            templates[f] = np.array(img)
+
     return templates
 
+def simple_difference(template, test):
+    if template.shape != test.shape:
+        test = np.array(Image.fromarray(test).resize(
+            (template.shape[1], template.shape[0])
+        ))
 
-def find_best_matching_template(test_img, template_dict):
-    best_score = -1
-    best_name = None
-    best_img = None
+    diff = np.abs(template.astype(int) - test.astype(int))
+    score = np.mean(diff)
 
-    test_thumb = cv2.resize(test_img, (200, 200))
-    test_gray = cv2.cvtColor(test_thumb, cv2.COLOR_BGR2GRAY)
+    return score
 
-    for name, tmpl_img in template_dict.items():
-        tmpl_thumb = cv2.resize(tmpl_img, (200, 200))
-        tmpl_gray = cv2.cvtColor(tmpl_thumb, cv2.COLOR_BGR2GRAY)
-        score = cv2.matchTemplate(test_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)[0][0]
+# Sidebar
+st.sidebar.title("⚙ Configuration")
+model_path = st.sidebar.text_input("Model Path", "best.pt")
+model = load_model(model_path)
 
-        if score > best_score:
-            best_score = score
-            best_name = name
-            best_img = tmpl_img
+templates = load_templates(TEMPLATE_DIR)
+st.sidebar.success(f"Loaded {len(templates)} templates")
 
-    return best_name, best_img, best_score
+st.title("🔍 Universal PCB Diagnostic Hub")
 
+uploaded_files = st.file_uploader(
+    "Upload PCB Images",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True
+)
 
-def determine_qc_status(detections):
-    if not detections: return "PASS", "✅", "#28a745"
-    CRITICAL = ["open_circuit", "short", "missing_hole"]
-    if any(d['Type'] in CRITICAL for d in detections):
-        return "SCRAP", "❌", "#dc3545"
-    return "REWORK", "⚠️", "#ffc107"
+if uploaded_files and st.button("🚀 Start Scan"):
 
+    if not templates:
+        st.error("No templates found in PCB_USED folder")
+        st.stop()
 
-def generate_heatmap(template_shape, detections_subset):
-    heatmap_mask = np.zeros((template_shape[0], template_shape[1]), dtype=np.uint8)
-    for det in detections_subset:
-        try:
-            loc = det['Location'].replace('(', '').replace(')', '').split(',')
-            x, y = int(loc[0]), int(loc[1])
-            cv2.circle(heatmap_mask, (x, y), 40, (50), -1)
-            cv2.circle(heatmap_mask, (x, y), 20, (100), -1)
-            cv2.circle(heatmap_mask, (x, y), 5, (255), -1)
-        except:
-            continue
-    heatmap_color = cv2.applyColorMap(heatmap_mask, cv2.COLORMAP_JET)
-    return heatmap_color
+    for file in uploaded_files:
+        image = Image.open(file).convert("RGB")
+        test_img = np.array(image)
 
+        best_score = 999999
+        best_template = None
+        best_name = None
 
-def analyze_pcb(template_img, test_img, model):
-    gray_template = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
-    gray_test = cv2.cvtColor(test_img, cv2.COLOR_BGR2GRAY)
+        for name, tmpl in templates.items():
+            score = simple_difference(tmpl, test_img)
+            if score < best_score:
+                best_score = score
+                best_template = tmpl
+                best_name = name
 
-    if gray_template.shape != gray_test.shape:
-        test_img = cv2.resize(test_img, (template_img.shape[1], template_img.shape[0]))
-        gray_test = cv2.resize(gray_test, (template_img.shape[1], template_img.shape[0]))
+        st.subheader(file.name)
+        st.image(test_img, caption="Uploaded Image")
 
-    diff = cv2.absdiff(gray_template, gray_test)
-    _, thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if model:
+            results = model(test_img)
+            st.write(results[0].summary())
+        else:
+            st.info("Model not loaded.")
 
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        st.success(f"Matched Template: {best_name}")    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     final_output = test_img.copy()
@@ -253,3 +229,4 @@ if files_to_process and st.button("🚀 Start Universal Scan"):
                     st.image(overlay, channels="BGR", use_container_width=True)
 
         st.download_button("📥 Download Report (CSV)", final_report.to_csv(index=False).encode('utf-8'), "report.csv", "text/csv")
+
